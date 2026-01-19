@@ -349,6 +349,7 @@ The System.Text.Json library is built-in as part of the shared framework in .NET
     <Compile Include="$(CommonPath)System\Obsoletions.cs" Link="Common\System\Obsoletions.cs" />
     <Compile Include="System\ThrowHelper.cs" />
 
+    <Compile Include="$(CoreLibSharedDir)System\A5Hash.cs" Link="Common\System\A5Hash.cs" />
     <Compile Include="$(CoreLibSharedDir)System\Marvin.cs" Link="Common\System\Marvin.cs" />
   </ItemGroup>
 

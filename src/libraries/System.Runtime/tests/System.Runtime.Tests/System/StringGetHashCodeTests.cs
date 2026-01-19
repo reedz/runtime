@@ -72,6 +72,19 @@ namespace System.Tests
             Assert.Equal(input.ToUpperInvariant().GetHashCode(), input.GetHashCode(StringComparison.OrdinalIgnoreCase));
         }
 
+        [ConditionalFact(typeof(RemoteExecutor), nameof(RemoteExecutor.IsSupported))]
+        public void GetHashCode_OrdinalIgnoreCase_WithA5HashEnabled_ReturnsSameHashCodeAsUpperCaseOrdinal()
+        {
+            RemoteInvokeOptions options = new RemoteInvokeOptions();
+            options.StartInfo.EnvironmentVariables["DOTNET_SYSTEM_HASHING_USE_A5HASH"] = "1";
+
+            RemoteExecutor.Invoke(() =>
+            {
+                string input = "AaBbCcDdEeFfGgHh\u00E9";
+                Assert.Equal(input.ToUpperInvariant().GetHashCode(), input.GetHashCode(StringComparison.OrdinalIgnoreCase));
+            }, options).Dispose();
+        }
+
         public static IEnumerable<object[]> GetHashCodeOrdinalIgnoreCase_TestData()
         {
             // 0 through 8 char lowercase & uppercase ASCII strings

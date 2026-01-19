@@ -16,6 +16,55 @@ namespace System
 {
     internal static partial class Marvin
     {
+        private static readonly bool s_useA5Hash = GetUseA5Hash();
+
+        private static bool GetUseA5Hash()
+        {
+            if (TryGetBooleanEnvironmentVariable("DOTNET_SYSTEM_HASHING_USE_A5HASH", out bool value))
+            {
+                return value;
+            }
+
+            return AppContext.TryGetSwitch("Switch.System.Hashing.UseA5Hash", out value) && value;
+        }
+
+        private static bool TryGetBooleanEnvironmentVariable(string variable, out bool value)
+        {
+            string? str = Environment.GetEnvironmentVariable(variable);
+            if (str is not null)
+            {
+                if (str.Length == 1)
+                {
+                    if (str[0] == '1')
+                    {
+                        value = true;
+                        return true;
+                    }
+
+                    if (str[0] == '0')
+                    {
+                        value = false;
+                        return true;
+                    }
+                }
+
+                if (str.Equals("true", StringComparison.OrdinalIgnoreCase))
+                {
+                    value = true;
+                    return true;
+                }
+
+                if (str.Equals("false", StringComparison.OrdinalIgnoreCase))
+                {
+                    value = false;
+                    return true;
+                }
+            }
+
+            value = default;
+            return false;
+        }
+
         /// <summary>
         /// Compute a Marvin hash and collapse it into a 32-bit hash.
         /// </summary>
@@ -28,6 +77,11 @@ namespace System
         [MethodImpl(MethodImplOptions.NoInlining)]
         public static int ComputeHash32(ref byte data, uint count, uint p0, uint p1)
         {
+            if (s_useA5Hash && count <= int.MaxValue)
+            {
+                return (int)A5Hash.Hash32(ref data, (int)count, p0, p1);
+            }
+
             // Control flow of this method generally flows top-to-bottom, trying to
             // minimize the number of branches taken for large (>= 8 bytes, 4 chars) inputs.
             // If small inputs (< 8 bytes, 4 chars) are given, this jumps to a "small inputs"
