@@ -9,7 +9,6 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
-using System.Text.Unicode;
 using ArmAes = System.Runtime.Intrinsics.Arm.Aes;
 using X86Aes = System.Runtime.Intrinsics.X86.Aes;
 
@@ -98,8 +97,48 @@ namespace System
                 return ComputeHash32OrdinalIgnoreCaseArm(ref data, count, seed);
             }
 
-            // Should not reach here if IsSupported was checked
             return 0;
+        }
+
+        /// <summary>
+        /// Check if UTF-16 chars in a vector are all ASCII and uppercase them.
+        /// Only checks/uppercases the first 'count' chars (remaining positions may contain garbage).
+        /// </summary>
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        private static bool TryUppercaseAsciiVector(Vector128<ushort> chars, int count, out Vector128<ushort> uppercased)
+        {
+            // For full vectors, check all 8 chars
+            if (count == 8)
+            {
+                Vector128<ushort> asciiMask = Vector128.Create((ushort)0xFF80);
+                if ((chars & asciiMask) != Vector128<ushort>.Zero)
+                {
+                    uppercased = default;
+                    return false;
+                }
+            }
+            else
+            {
+                // For partial vectors, we can't use the garbage bytes for ASCII check
+                // Check each valid char individually using scalar operations
+                ref ushort charRef = ref Unsafe.As<Vector128<ushort>, ushort>(ref chars);
+                for (int i = 0; i < count; i++)
+                {
+                    if (Unsafe.Add(ref charRef, i) > 0x7F)
+                    {
+                        uppercased = default;
+                        return false;
+                    }
+                }
+            }
+
+            // Branchless uppercase: XOR with 0x20 if char is in [a-z]
+            Vector128<ushort> lowerIndicator = chars + Vector128.Create((ushort)(0x0080 - 0x0061));
+            Vector128<ushort> upperIndicator = chars + Vector128.Create((ushort)(0x0080 - 0x007B));
+            Vector128<ushort> combined = lowerIndicator ^ upperIndicator;
+            Vector128<ushort> caseFlipMask = (combined & Vector128.Create((ushort)0x0080)) >> 2;
+            uppercased = chars ^ caseFlipMask;
+            return true;
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
@@ -108,52 +147,130 @@ namespace System
         {
             Debug.Assert(X86Aes.IsSupported);
 
-            // Fast path for short ASCII strings - uppercase into stack buffer
-            if ((uint)count <= 64)
+            if (count == 0)
             {
-                // Check if all chars are ASCII and uppercase into stack buffer
-                Span<char> buffer = stackalloc char[64];
-                nuint offset = 0;
-                uint remaining = (uint)count;
-
-                // Process 2 chars at a time
-                while (remaining >= 2)
-                {
-                    uint twoChars = Unsafe.ReadUnaligned<uint>(
-                        ref Unsafe.As<char, byte>(ref Unsafe.AddByteOffset(ref data, offset)));
-                    if (!Utf16Utility.AllCharsInUInt32AreAscii(twoChars))
-                    {
-                        goto NotAscii;
-                    }
-                    uint uppercased = Utf16Utility.ConvertAllAsciiCharsInUInt32ToUppercase(twoChars);
-                    Unsafe.WriteUnaligned(ref Unsafe.As<char, byte>(ref buffer[(int)(offset / 2)]), uppercased);
-                    offset += 4;
-                    remaining -= 2;
-                }
-
-                // Process remaining char if odd count
-                if (remaining > 0)
-                {
-                    uint oneChar = Unsafe.AddByteOffset(ref data, offset);
-                    if (oneChar > 0x7Fu)
-                    {
-                        goto NotAscii;
-                    }
-                    // Branchless uppercase for single ASCII char
-                    uint lowerIndicator = oneChar + 0x0080u - 0x0061u;
-                    uint upperIndicator = oneChar + 0x0080u - 0x007Bu;
-                    uint mask = ((lowerIndicator ^ upperIndicator) & 0x0080u) >> 2;
-                    buffer[(int)(offset / 2)] = (char)(oneChar ^ mask);
-                }
-
-                // All ASCII - hash the uppercased buffer
-                return ComputeHash32X86(
-                    ref Unsafe.As<char, byte>(ref MemoryMarshal.GetReference(buffer)),
-                    count * 2,
-                    seed);
+                Vector128<byte> empty = Vector128<byte>.Zero;
+                Vector128<byte> hash = X86Aes.Encrypt(empty, Unsafe.As<UInt128, Vector128<byte>>(ref seed));
+                return FinalizeX86(hash).AsInt32().GetElement(0);
             }
 
-        NotAscii:
+            ref byte bytePtr = ref Unsafe.As<char, byte>(ref data);
+            int byteCount = count * 2;
+
+            // For single vector (≤8 chars), inline uppercase + hash
+            if (count <= 8)
+            {
+                Vector128<ushort> chars;
+                bool needMask = count < 8;
+
+                // Check page boundary for safe reading
+                unsafe
+                {
+                    nint address = (nint)Unsafe.AsPointer(ref bytePtr);
+                    nint offsetWithinPage = address & 0xFFF;
+                    if (offsetWithinPage > 0x1000 - 16)
+                    {
+                        // Near page boundary - use safe copy
+                        Span<ushort> temp = stackalloc ushort[8];
+                        temp.Clear();
+                        Unsafe.CopyBlockUnaligned(ref Unsafe.As<ushort, byte>(ref temp[0]), ref bytePtr, (uint)byteCount);
+                        chars = Unsafe.ReadUnaligned<Vector128<ushort>>(ref Unsafe.As<ushort, byte>(ref temp[0]));
+                    }
+                    else
+                    {
+                        // Safe to read full 16 bytes
+                        chars = Unsafe.ReadUnaligned<Vector128<ushort>>(ref bytePtr);
+                    }
+                }
+
+                if (!TryUppercaseAsciiVector(chars, count, out Vector128<ushort> uppercased))
+                {
+                    goto SlowPath;
+                }
+
+                Vector128<byte> hashVector = uppercased.AsByte();
+                if (needMask)
+                {
+                    Vector128<byte> mask = Vector128.GreaterThan(Vector128.Create((sbyte)byteCount), Indices).AsByte();
+                    hashVector = Vector128.BitwiseAnd(mask, hashVector);
+                }
+                hashVector = Vector128.Add(hashVector, Vector128.Create((byte)byteCount));
+
+                Vector128<byte> hash = X86Aes.Encrypt(hashVector, Unsafe.As<UInt128, Vector128<byte>>(ref seed));
+                return FinalizeX86(hash).AsInt32().GetElement(0);
+            }
+
+            // Multi-vector path: process 8 chars at a time with inline uppercase
+            {
+                ref ushort ptr = ref Unsafe.As<byte, ushort>(ref bytePtr);
+                int fullVectors = count / 8;
+                int remainder = count % 8;
+                Vector128<byte> hashVector;
+
+                // Process first partial chunk if any
+                if (remainder > 0)
+                {
+                    int remainderBytes = remainder * 2;
+                    Vector128<ushort> chars;
+
+                    unsafe
+                    {
+                        nint address = (nint)Unsafe.AsPointer(ref Unsafe.As<ushort, byte>(ref ptr));
+                        nint offsetWithinPage = address & 0xFFF;
+                        if (offsetWithinPage > 0x1000 - 16)
+                        {
+                            Span<ushort> temp = stackalloc ushort[8];
+                            temp.Clear();
+                            Unsafe.CopyBlockUnaligned(ref Unsafe.As<ushort, byte>(ref temp[0]),
+                                ref Unsafe.As<ushort, byte>(ref ptr), (uint)remainderBytes);
+                            chars = Unsafe.ReadUnaligned<Vector128<ushort>>(ref Unsafe.As<ushort, byte>(ref temp[0]));
+                        }
+                        else
+                        {
+                            chars = Unsafe.ReadUnaligned<Vector128<ushort>>(ref Unsafe.As<ushort, byte>(ref ptr));
+                        }
+                    }
+
+                    if (!TryUppercaseAsciiVector(chars, remainder, out Vector128<ushort> uppercased))
+                    {
+                        goto SlowPath;
+                    }
+
+                    hashVector = uppercased.AsByte();
+                    Vector128<byte> mask = Vector128.GreaterThan(Vector128.Create((sbyte)remainderBytes), Indices).AsByte();
+                    hashVector = Vector128.BitwiseAnd(mask, hashVector);
+                    hashVector = Vector128.Add(hashVector, Vector128.Create((byte)remainderBytes));
+                    ptr = ref Unsafe.Add(ref ptr, remainder);
+                }
+                else
+                {
+                    Vector128<ushort> chars = Unsafe.ReadUnaligned<Vector128<ushort>>(ref Unsafe.As<ushort, byte>(ref ptr));
+                    if (!TryUppercaseAsciiVector(chars, 8, out Vector128<ushort> uppercased))
+                    {
+                        goto SlowPath;
+                    }
+                    hashVector = uppercased.AsByte();
+                    ptr = ref Unsafe.Add(ref ptr, 8);
+                    fullVectors--;
+                }
+
+                // Process remaining full vectors
+                for (int i = 0; i < fullVectors; i++)
+                {
+                    Vector128<ushort> chars = Unsafe.ReadUnaligned<Vector128<ushort>>(ref Unsafe.As<ushort, byte>(ref ptr));
+                    if (!TryUppercaseAsciiVector(chars, 8, out Vector128<ushort> uppercased))
+                    {
+                        goto SlowPath;
+                    }
+                    hashVector = CompressTwoX86(hashVector, uppercased.AsByte());
+                    ptr = ref Unsafe.Add(ref ptr, 8);
+                }
+
+                Vector128<byte> hash = X86Aes.Encrypt(hashVector, Unsafe.As<UInt128, Vector128<byte>>(ref seed));
+                return FinalizeX86(hash).AsInt32().GetElement(0);
+            }
+
+        SlowPath:
             return ComputeHash32OrdinalIgnoreCaseSlow(ref data, count, seed);
         }
 
@@ -163,64 +280,134 @@ namespace System
         {
             Debug.Assert(ArmAes.IsSupported);
 
-            // Fast path for short ASCII strings - uppercase into stack buffer
-            if ((uint)count <= 64)
+            if (count == 0)
             {
-                // Check if all chars are ASCII and uppercase into stack buffer
-                Span<char> buffer = stackalloc char[64];
-                nuint offset = 0;
-                uint remaining = (uint)count;
-
-                // Process 2 chars at a time
-                while (remaining >= 2)
-                {
-                    uint twoChars = Unsafe.ReadUnaligned<uint>(
-                        ref Unsafe.As<char, byte>(ref Unsafe.AddByteOffset(ref data, offset)));
-                    if (!Utf16Utility.AllCharsInUInt32AreAscii(twoChars))
-                    {
-                        goto NotAscii;
-                    }
-                    uint uppercased = Utf16Utility.ConvertAllAsciiCharsInUInt32ToUppercase(twoChars);
-                    Unsafe.WriteUnaligned(ref Unsafe.As<char, byte>(ref buffer[(int)(offset / 2)]), uppercased);
-                    offset += 4;
-                    remaining -= 2;
-                }
-
-                // Process remaining char if odd count
-                if (remaining > 0)
-                {
-                    uint oneChar = Unsafe.AddByteOffset(ref data, offset);
-                    if (oneChar > 0x7Fu)
-                    {
-                        goto NotAscii;
-                    }
-                    // Branchless uppercase for single ASCII char
-                    uint lowerIndicator = oneChar + 0x0080u - 0x0061u;
-                    uint upperIndicator = oneChar + 0x0080u - 0x007Bu;
-                    uint mask = ((lowerIndicator ^ upperIndicator) & 0x0080u) >> 2;
-                    buffer[(int)(offset / 2)] = (char)(oneChar ^ mask);
-                }
-
-                // All ASCII - hash the uppercased buffer
-                return ComputeHash32Arm(
-                    ref Unsafe.As<char, byte>(ref MemoryMarshal.GetReference(buffer)),
-                    count * 2,
-                    seed);
+                Vector128<byte> empty = Vector128<byte>.Zero;
+                Vector128<byte> hash = ArmAes.MixColumns(ArmAes.Encrypt(empty, Vector128<byte>.Zero)) ^ Unsafe.As<UInt128, Vector128<byte>>(ref seed);
+                return FinalizeArm(hash).AsInt32().GetElement(0);
             }
 
-        NotAscii:
+            ref byte bytePtr = ref Unsafe.As<char, byte>(ref data);
+            int byteCount = count * 2;
+
+            // For single vector (≤8 chars), inline uppercase + hash
+            if (count <= 8)
+            {
+                Vector128<ushort> chars;
+                bool needMask = count < 8;
+
+                unsafe
+                {
+                    nint address = (nint)Unsafe.AsPointer(ref bytePtr);
+                    nint offsetWithinPage = address & 0xFFF;
+                    if (offsetWithinPage > 0x1000 - 16)
+                    {
+                        Span<ushort> temp = stackalloc ushort[8];
+                        temp.Clear();
+                        Unsafe.CopyBlockUnaligned(ref Unsafe.As<ushort, byte>(ref temp[0]), ref bytePtr, (uint)byteCount);
+                        chars = Unsafe.ReadUnaligned<Vector128<ushort>>(ref Unsafe.As<ushort, byte>(ref temp[0]));
+                    }
+                    else
+                    {
+                        chars = Unsafe.ReadUnaligned<Vector128<ushort>>(ref bytePtr);
+                    }
+                }
+
+                if (!TryUppercaseAsciiVector(chars, count, out Vector128<ushort> uppercased))
+                {
+                    goto SlowPath;
+                }
+
+                Vector128<byte> hashVector = uppercased.AsByte();
+                if (needMask)
+                {
+                    Vector128<byte> mask = Vector128.GreaterThan(Vector128.Create((sbyte)byteCount), Indices).AsByte();
+                    hashVector = Vector128.BitwiseAnd(mask, hashVector);
+                }
+                hashVector = Vector128.Add(hashVector, Vector128.Create((byte)byteCount));
+
+                Vector128<byte> hash = ArmAes.MixColumns(ArmAes.Encrypt(hashVector, Vector128<byte>.Zero)) ^ Unsafe.As<UInt128, Vector128<byte>>(ref seed);
+                return FinalizeArm(hash).AsInt32().GetElement(0);
+            }
+
+            // Multi-vector path
+            {
+                ref ushort ptr = ref Unsafe.As<byte, ushort>(ref bytePtr);
+                int fullVectors = count / 8;
+                int remainder = count % 8;
+                Vector128<byte> hashVector;
+
+                if (remainder > 0)
+                {
+                    int remainderBytes = remainder * 2;
+                    Vector128<ushort> chars;
+
+                    unsafe
+                    {
+                        nint address = (nint)Unsafe.AsPointer(ref Unsafe.As<ushort, byte>(ref ptr));
+                        nint offsetWithinPage = address & 0xFFF;
+                        if (offsetWithinPage > 0x1000 - 16)
+                        {
+                            Span<ushort> temp = stackalloc ushort[8];
+                            temp.Clear();
+                            Unsafe.CopyBlockUnaligned(ref Unsafe.As<ushort, byte>(ref temp[0]),
+                                ref Unsafe.As<ushort, byte>(ref ptr), (uint)remainderBytes);
+                            chars = Unsafe.ReadUnaligned<Vector128<ushort>>(ref Unsafe.As<ushort, byte>(ref temp[0]));
+                        }
+                        else
+                        {
+                            chars = Unsafe.ReadUnaligned<Vector128<ushort>>(ref Unsafe.As<ushort, byte>(ref ptr));
+                        }
+                    }
+
+                    if (!TryUppercaseAsciiVector(chars, remainder, out Vector128<ushort> uppercased))
+                    {
+                        goto SlowPath;
+                    }
+
+                    hashVector = uppercased.AsByte();
+                    Vector128<byte> mask = Vector128.GreaterThan(Vector128.Create((sbyte)remainderBytes), Indices).AsByte();
+                    hashVector = Vector128.BitwiseAnd(mask, hashVector);
+                    hashVector = Vector128.Add(hashVector, Vector128.Create((byte)remainderBytes));
+                    ptr = ref Unsafe.Add(ref ptr, remainder);
+                }
+                else
+                {
+                    Vector128<ushort> chars = Unsafe.ReadUnaligned<Vector128<ushort>>(ref Unsafe.As<ushort, byte>(ref ptr));
+                    if (!TryUppercaseAsciiVector(chars, 8, out Vector128<ushort> uppercased))
+                    {
+                        goto SlowPath;
+                    }
+                    hashVector = uppercased.AsByte();
+                    ptr = ref Unsafe.Add(ref ptr, 8);
+                    fullVectors--;
+                }
+
+                for (int i = 0; i < fullVectors; i++)
+                {
+                    Vector128<ushort> chars = Unsafe.ReadUnaligned<Vector128<ushort>>(ref Unsafe.As<ushort, byte>(ref ptr));
+                    if (!TryUppercaseAsciiVector(chars, 8, out Vector128<ushort> uppercased))
+                    {
+                        goto SlowPath;
+                    }
+                    hashVector = CompressTwoArm(hashVector, uppercased.AsByte());
+                    ptr = ref Unsafe.Add(ref ptr, 8);
+                }
+
+                Vector128<byte> hash = ArmAes.MixColumns(ArmAes.Encrypt(hashVector, Vector128<byte>.Zero)) ^ Unsafe.As<UInt128, Vector128<byte>>(ref seed);
+                return FinalizeArm(hash).AsInt32().GetElement(0);
+            }
+
+        SlowPath:
             return ComputeHash32OrdinalIgnoreCaseSlow(ref data, count, seed);
         }
 
         private static int ComputeHash32OrdinalIgnoreCaseSlow(ref char data, int count, UInt128 seed)
         {
-            Debug.Assert(count > 0);
-
             char[]? borrowedArr = null;
             Span<char> scratch = (uint)count <= 64 ? stackalloc char[64] : (borrowedArr = ArrayPool<char>.Shared.Rent(count));
 
             int charsWritten = Globalization.Ordinal.ToUpperOrdinal(new ReadOnlySpan<char>(ref data, count), scratch);
-            Debug.Assert(charsWritten == count);
 
             int hash = ComputeHash32(
                 ref Unsafe.As<char, byte>(ref MemoryMarshal.GetReference(scratch)),
