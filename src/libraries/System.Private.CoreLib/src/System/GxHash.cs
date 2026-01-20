@@ -9,6 +9,7 @@ using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
+using System.Text.Unicode;
 using ArmAes = System.Runtime.Intrinsics.Arm.Aes;
 using X86Aes = System.Runtime.Intrinsics.X86.Aes;
 
@@ -87,20 +88,145 @@ namespace System
         /// </summary>
         public static int ComputeHash32OrdinalIgnoreCase(ref char data, int count, UInt128 seed)
         {
-            // For the OrdinalIgnoreCase comparison, we need to uppercase and then hash.
-            // This ensures that str.ToUpperInvariant().GetHashCode() == str.GetHashCode(OrdinalIgnoreCase)
+            if (X86Aes.IsSupported)
+            {
+                return ComputeHash32OrdinalIgnoreCaseX86(ref data, count, seed);
+            }
+
+            if (ArmAes.IsSupported)
+            {
+                return ComputeHash32OrdinalIgnoreCaseArm(ref data, count, seed);
+            }
+
+            // Should not reach here if IsSupported was checked
+            return 0;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [CompExactlyDependsOn(typeof(X86Aes))]
+        private static int ComputeHash32OrdinalIgnoreCaseX86(ref char data, int count, UInt128 seed)
+        {
+            Debug.Assert(X86Aes.IsSupported);
+
+            // Fast path for short ASCII strings - uppercase into stack buffer
+            if ((uint)count <= 64)
+            {
+                // Check if all chars are ASCII and uppercase into stack buffer
+                Span<char> buffer = stackalloc char[64];
+                nuint offset = 0;
+                uint remaining = (uint)count;
+
+                // Process 2 chars at a time
+                while (remaining >= 2)
+                {
+                    uint twoChars = Unsafe.ReadUnaligned<uint>(
+                        ref Unsafe.As<char, byte>(ref Unsafe.AddByteOffset(ref data, offset)));
+                    if (!Utf16Utility.AllCharsInUInt32AreAscii(twoChars))
+                    {
+                        goto NotAscii;
+                    }
+                    uint uppercased = Utf16Utility.ConvertAllAsciiCharsInUInt32ToUppercase(twoChars);
+                    Unsafe.WriteUnaligned(ref Unsafe.As<char, byte>(ref buffer[(int)(offset / 2)]), uppercased);
+                    offset += 4;
+                    remaining -= 2;
+                }
+
+                // Process remaining char if odd count
+                if (remaining > 0)
+                {
+                    uint oneChar = Unsafe.AddByteOffset(ref data, offset);
+                    if (oneChar > 0x7Fu)
+                    {
+                        goto NotAscii;
+                    }
+                    // Branchless uppercase for single ASCII char
+                    uint lowerIndicator = oneChar + 0x0080u - 0x0061u;
+                    uint upperIndicator = oneChar + 0x0080u - 0x007Bu;
+                    uint mask = ((lowerIndicator ^ upperIndicator) & 0x0080u) >> 2;
+                    buffer[(int)(offset / 2)] = (char)(oneChar ^ mask);
+                }
+
+                // All ASCII - hash the uppercased buffer
+                return ComputeHash32X86(
+                    ref Unsafe.As<char, byte>(ref MemoryMarshal.GetReference(buffer)),
+                    count * 2,
+                    seed);
+            }
+
+        NotAscii:
+            return ComputeHash32OrdinalIgnoreCaseSlow(ref data, count, seed);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [CompExactlyDependsOn(typeof(ArmAes))]
+        private static int ComputeHash32OrdinalIgnoreCaseArm(ref char data, int count, UInt128 seed)
+        {
+            Debug.Assert(ArmAes.IsSupported);
+
+            // Fast path for short ASCII strings - uppercase into stack buffer
+            if ((uint)count <= 64)
+            {
+                // Check if all chars are ASCII and uppercase into stack buffer
+                Span<char> buffer = stackalloc char[64];
+                nuint offset = 0;
+                uint remaining = (uint)count;
+
+                // Process 2 chars at a time
+                while (remaining >= 2)
+                {
+                    uint twoChars = Unsafe.ReadUnaligned<uint>(
+                        ref Unsafe.As<char, byte>(ref Unsafe.AddByteOffset(ref data, offset)));
+                    if (!Utf16Utility.AllCharsInUInt32AreAscii(twoChars))
+                    {
+                        goto NotAscii;
+                    }
+                    uint uppercased = Utf16Utility.ConvertAllAsciiCharsInUInt32ToUppercase(twoChars);
+                    Unsafe.WriteUnaligned(ref Unsafe.As<char, byte>(ref buffer[(int)(offset / 2)]), uppercased);
+                    offset += 4;
+                    remaining -= 2;
+                }
+
+                // Process remaining char if odd count
+                if (remaining > 0)
+                {
+                    uint oneChar = Unsafe.AddByteOffset(ref data, offset);
+                    if (oneChar > 0x7Fu)
+                    {
+                        goto NotAscii;
+                    }
+                    // Branchless uppercase for single ASCII char
+                    uint lowerIndicator = oneChar + 0x0080u - 0x0061u;
+                    uint upperIndicator = oneChar + 0x0080u - 0x007Bu;
+                    uint mask = ((lowerIndicator ^ upperIndicator) & 0x0080u) >> 2;
+                    buffer[(int)(offset / 2)] = (char)(oneChar ^ mask);
+                }
+
+                // All ASCII - hash the uppercased buffer
+                return ComputeHash32Arm(
+                    ref Unsafe.As<char, byte>(ref MemoryMarshal.GetReference(buffer)),
+                    count * 2,
+                    seed);
+            }
+
+        NotAscii:
+            return ComputeHash32OrdinalIgnoreCaseSlow(ref data, count, seed);
+        }
+
+        private static int ComputeHash32OrdinalIgnoreCaseSlow(ref char data, int count, UInt128 seed)
+        {
+            Debug.Assert(count > 0);
+
             char[]? borrowedArr = null;
             Span<char> scratch = (uint)count <= 64 ? stackalloc char[64] : (borrowedArr = ArrayPool<char>.Shared.Rent(count));
 
             int charsWritten = Globalization.Ordinal.ToUpperOrdinal(new ReadOnlySpan<char>(ref data, count), scratch);
+            Debug.Assert(charsWritten == count);
 
-            // Compute hash on the uppercased string
             int hash = ComputeHash32(
                 ref Unsafe.As<char, byte>(ref MemoryMarshal.GetReference(scratch)),
-                charsWritten * 2 /* in bytes, not chars */,
+                charsWritten * 2,
                 seed);
 
-            // Return the borrowed array if necessary.
             if (borrowedArr is not null)
             {
                 ArrayPool<char>.Shared.Return(borrowedArr);
