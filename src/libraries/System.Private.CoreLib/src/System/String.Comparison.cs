@@ -683,9 +683,15 @@ namespace System
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public override int GetHashCode()
         {
-            ulong seed = Marvin.DefaultSeed;
+            // Use GxHash when hardware AES is available (modern x64/ARM64 CPUs)
+            // Fall back to Marvin for older CPUs without AES support
+            if (GxHash.IsSupported)
+            {
+                // Multiplication below will not overflow since going from positive Int32 to UInt32.
+                return GxHash.ComputeHash32(ref Unsafe.As<char, byte>(ref _firstChar), (int)((uint)_stringLength * 2) /* in bytes, not chars */, GxHash.DefaultSeed);
+            }
 
-            // Multiplication below will not overflow since going from positive Int32 to UInt32.
+            ulong seed = Marvin.DefaultSeed;
             return Marvin.ComputeHash32(ref Unsafe.As<char, byte>(ref _firstChar), (uint)_stringLength * 2 /* in bytes, not chars */, (uint)seed, (uint)(seed >> 32));
         }
 
@@ -696,6 +702,13 @@ namespace System
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal int GetHashCodeOrdinalIgnoreCase()
         {
+            // Use GxHash when hardware AES is available (modern x64/ARM64 CPUs)
+            // Fall back to Marvin for older CPUs without AES support
+            if (GxHash.IsSupported)
+            {
+                return GxHash.ComputeHash32OrdinalIgnoreCase(ref _firstChar, _stringLength /* in chars, not bytes */, GxHash.DefaultSeed);
+            }
+
             ulong seed = Marvin.DefaultSeed;
             return Marvin.ComputeHash32OrdinalIgnoreCase(ref _firstChar, _stringLength /* in chars, not bytes */, (uint)seed, (uint)(seed >> 32));
         }
@@ -704,9 +717,15 @@ namespace System
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int GetHashCode(ReadOnlySpan<char> value)
         {
-            ulong seed = Marvin.DefaultSeed;
+            // Use GxHash when hardware AES is available (modern x64/ARM64 CPUs)
+            // Fall back to Marvin for older CPUs without AES support
+            if (GxHash.IsSupported)
+            {
+                // Multiplication below will not overflow since going from positive Int32 to UInt32.
+                return GxHash.ComputeHash32(ref Unsafe.As<char, byte>(ref MemoryMarshal.GetReference(value)), (int)((uint)value.Length * 2) /* in bytes, not chars */, GxHash.DefaultSeed);
+            }
 
-            // Multiplication below will not overflow since going from positive Int32 to UInt32.
+            ulong seed = Marvin.DefaultSeed;
             return Marvin.ComputeHash32(ref Unsafe.As<char, byte>(ref MemoryMarshal.GetReference(value)), (uint)value.Length * 2 /* in bytes, not chars */, (uint)seed, (uint)(seed >> 32));
         }
 
@@ -739,6 +758,13 @@ namespace System
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         internal static int GetHashCodeOrdinalIgnoreCase(ReadOnlySpan<char> value)
         {
+            // Use GxHash when hardware AES is available (modern x64/ARM64 CPUs)
+            // Fall back to Marvin for older CPUs without AES support
+            if (GxHash.IsSupported)
+            {
+                return GxHash.ComputeHash32OrdinalIgnoreCase(ref MemoryMarshal.GetReference(value), value.Length /* in chars, not bytes */, GxHash.DefaultSeed);
+            }
+
             ulong seed = Marvin.DefaultSeed;
             return Marvin.ComputeHash32OrdinalIgnoreCase(ref MemoryMarshal.GetReference(value), value.Length /* in chars, not bytes */, (uint)seed, (uint)(seed >> 32));
         }
