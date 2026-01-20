@@ -5,6 +5,7 @@
 // Original implementation licensed under MIT.
 
 using System.Buffers;
+using System.Diagnostics;
 using System.Runtime.CompilerServices;
 using System.Runtime.InteropServices;
 using System.Runtime.Intrinsics;
@@ -20,6 +21,14 @@ namespace System
     {
         private const int VectorSize = 16;
         private const int UnrollFactor = 8;
+
+        // Pre-computed constants to avoid per-call materialization
+        private static readonly Vector128<byte> FinalizeKeys1 = Vector128.Create(0x713b01d0u, 0x8f2f35dbu, 0xaf163956u, 0x85459f85u).AsByte();
+        private static readonly Vector128<byte> FinalizeKeys2 = Vector128.Create(0x1de09647u, 0x92cfa39cu, 0x3dd99acau, 0xb89c054fu).AsByte();
+        private static readonly Vector128<byte> FinalizeKeys3 = Vector128.Create(0xc78b122bu, 0x5544b1b7u, 0x689d2b7du, 0xd0012e32u).AsByte();
+        private static readonly Vector128<byte> CompressKeys1 = Vector128.Create(0xFC3BC28Eu, 0x89C222E5u, 0xB09D3E21u, 0xF2784542u).AsByte();
+        private static readonly Vector128<byte> CompressKeys2 = Vector128.Create(0x03FCE279u, 0xCB6B2E9Bu, 0xB361DC58u, 0x39136BD9u).AsByte();
+        private static readonly Vector128<sbyte> Indices = Vector128.Create((sbyte)0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
 
         /// <summary>
         /// Returns true if GXHash is supported on the current platform.
@@ -48,8 +57,7 @@ namespace System
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int ComputeHash32(ReadOnlySpan<byte> data, UInt128 seed)
         {
-            return Finalize(CompressFast(Compress(ref MemoryMarshal.GetReference(data), data.Length), Unsafe.As<UInt128, Vector128<byte>>(ref seed)))
-                .AsInt32().GetElement(0);
+            return ComputeHash32(ref MemoryMarshal.GetReference(data), data.Length, seed);
         }
 
         /// <summary>
@@ -58,8 +66,18 @@ namespace System
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         public static int ComputeHash32(ref byte data, int length, UInt128 seed)
         {
-            return Finalize(CompressFast(Compress(ref data, length), Unsafe.As<UInt128, Vector128<byte>>(ref seed)))
-                .AsInt32().GetElement(0);
+            if (X86Aes.IsSupported)
+            {
+                return ComputeHash32X86(ref data, length, seed);
+            }
+
+            if (ArmAes.IsSupported)
+            {
+                return ComputeHash32Arm(ref data, length, seed);
+            }
+
+            // Should not reach here if IsSupported was checked
+            return 0;
         }
 
         /// <summary>
@@ -91,41 +109,40 @@ namespace System
             return hash;
         }
 
+        // ==================== X86 AES Implementation ====================
+
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static Vector128<byte> Finalize(Vector128<byte> input)
+        [CompExactlyDependsOn(typeof(X86Aes))]
+        private static int ComputeHash32X86(ref byte data, int length, UInt128 seed)
         {
-            Vector128<byte> keys1 = Vector128.Create(0x713b01d0u, 0x8f2f35dbu, 0xaf163956u, 0x85459f85u).AsByte();
-            Vector128<byte> keys2 = Vector128.Create(0x1de09647u, 0x92cfa39cu, 0x3dd99acau, 0xb89c054fu).AsByte();
-            Vector128<byte> keys3 = Vector128.Create(0xc78b122bu, 0x5544b1b7u, 0x689d2b7du, 0xd0012e32u).AsByte();
+            Debug.Assert(X86Aes.IsSupported);
 
-            Vector128<byte> output = input;
-
-            if (ArmAes.IsSupported)
-            {
-                // ARM Neon AES intrinsics differ from x86, requiring additional operations
-                // See https://blog.michaelbrase.com/2018/05/08/emulating-x86-aes-intrinsics-on-armv8-a
-                output = ArmAes.MixColumns(ArmAes.Encrypt(output, Vector128<byte>.Zero)) ^ keys1;
-                output = ArmAes.MixColumns(ArmAes.Encrypt(output, Vector128<byte>.Zero)) ^ keys2;
-                output = ArmAes.Encrypt(output, Vector128<byte>.Zero) ^ keys3;
-            }
-            else if (X86Aes.IsSupported)
-            {
-                output = X86Aes.Encrypt(output, keys1);
-                output = X86Aes.Encrypt(output, keys2);
-                output = X86Aes.EncryptLast(output, keys3);
-            }
-
-            return output;
+            Vector128<byte> hash = CompressX86(ref data, length);
+            hash = X86Aes.Encrypt(hash, Unsafe.As<UInt128, Vector128<byte>>(ref seed));
+            return FinalizeX86(hash).AsInt32().GetElement(0);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static Vector128<byte> Compress(ref byte data, int length)
+        [CompExactlyDependsOn(typeof(X86Aes))]
+        private static Vector128<byte> FinalizeX86(Vector128<byte> input)
         {
+            Debug.Assert(X86Aes.IsSupported);
+
+            Vector128<byte> output = X86Aes.Encrypt(input, FinalizeKeys1);
+            output = X86Aes.Encrypt(output, FinalizeKeys2);
+            return X86Aes.EncryptLast(output, FinalizeKeys3);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [CompExactlyDependsOn(typeof(X86Aes))]
+        private static Vector128<byte> CompressX86(ref byte data, int length)
+        {
+            Debug.Assert(X86Aes.IsSupported);
+
             ref Vector128<byte> ptr = ref Unsafe.As<byte, Vector128<byte>>(ref data);
 
             if (length <= VectorSize)
             {
-                // Input fits on a single SIMD vector
                 return GetPartialVector(ref ptr, length);
             }
 
@@ -141,7 +158,6 @@ namespace System
             }
             else
             {
-                // Start with the partial vector first for safe read-beyond
                 hashVector = GetPartialVectorUnsafe(ref ptr, extraBytesCount);
                 ptr = ref Unsafe.AddByteOffset(ref ptr, extraBytesCount);
                 remainingBytes = length - extraBytesCount;
@@ -149,42 +165,39 @@ namespace System
 
             if (length <= VectorSize * 2)
             {
-                // Fast path: 17-32 bytes
-                hashVector = CompressTwo(hashVector, ptr);
-            }
-            else if (length <= VectorSize * 3)
-            {
-                // Fast path: 33-48 bytes
-                hashVector = CompressTwo(hashVector, CompressTwo(ptr, Unsafe.Add(ref ptr, 1)));
-            }
-            else
-            {
-                // Large input: use high ILP loop
-                hashVector = CompressMany(ref ptr, hashVector, remainingBytes);
+                return CompressTwoX86(hashVector, ptr);
             }
 
-            return hashVector;
+            if (length <= VectorSize * 3)
+            {
+                return CompressTwoX86(hashVector, CompressTwoX86(ptr, Unsafe.Add(ref ptr, 1)));
+            }
+
+            return CompressManyX86(ref ptr, hashVector, remainingBytes);
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static Vector128<byte> CompressMany(ref Vector128<byte> start, Vector128<byte> hashVector, int len)
+        [CompExactlyDependsOn(typeof(X86Aes))]
+        private static Vector128<byte> CompressManyX86(ref Vector128<byte> start, Vector128<byte> hashVector, int len)
         {
+            Debug.Assert(X86Aes.IsSupported);
+
             int unrollableBlocksCount = len / (VectorSize * UnrollFactor) * UnrollFactor;
             ref Vector128<byte> end2 = ref Unsafe.Add(ref start, unrollableBlocksCount);
 
             while (Unsafe.IsAddressLessThan(ref start, ref end2))
             {
                 Vector128<byte> blockHash = start;
-                blockHash = CompressFast(blockHash, Unsafe.Add(ref start, 1));
-                blockHash = CompressFast(blockHash, Unsafe.Add(ref start, 2));
-                blockHash = CompressFast(blockHash, Unsafe.Add(ref start, 3));
-                blockHash = CompressFast(blockHash, Unsafe.Add(ref start, 4));
-                blockHash = CompressFast(blockHash, Unsafe.Add(ref start, 5));
-                blockHash = CompressFast(blockHash, Unsafe.Add(ref start, 6));
-                blockHash = CompressFast(blockHash, Unsafe.Add(ref start, 7));
+                blockHash = X86Aes.Encrypt(blockHash, Unsafe.Add(ref start, 1));
+                blockHash = X86Aes.Encrypt(blockHash, Unsafe.Add(ref start, 2));
+                blockHash = X86Aes.Encrypt(blockHash, Unsafe.Add(ref start, 3));
+                blockHash = X86Aes.Encrypt(blockHash, Unsafe.Add(ref start, 4));
+                blockHash = X86Aes.Encrypt(blockHash, Unsafe.Add(ref start, 5));
+                blockHash = X86Aes.Encrypt(blockHash, Unsafe.Add(ref start, 6));
+                blockHash = X86Aes.Encrypt(blockHash, Unsafe.Add(ref start, 7));
                 start = ref Unsafe.Add(ref start, UnrollFactor);
 
-                hashVector = CompressTwo(hashVector, blockHash);
+                hashVector = CompressTwoX86(hashVector, blockHash);
             }
 
             int remainingBlocksCount = len / VectorSize - unrollableBlocksCount;
@@ -192,7 +205,7 @@ namespace System
 
             while (Unsafe.IsAddressLessThan(ref start, ref end))
             {
-                hashVector = CompressTwo(hashVector, start);
+                hashVector = CompressTwoX86(hashVector, start);
                 start = ref Unsafe.Add(ref start, 1);
             }
 
@@ -200,10 +213,135 @@ namespace System
         }
 
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [CompExactlyDependsOn(typeof(X86Aes))]
+        private static Vector128<byte> CompressTwoX86(Vector128<byte> a, Vector128<byte> b)
+        {
+            Debug.Assert(X86Aes.IsSupported);
+
+            b = X86Aes.Encrypt(b, CompressKeys1);
+            b = X86Aes.Encrypt(b, CompressKeys2);
+            return X86Aes.EncryptLast(a, b);
+        }
+
+        // ==================== ARM AES Implementation ====================
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [CompExactlyDependsOn(typeof(ArmAes))]
+        private static int ComputeHash32Arm(ref byte data, int length, UInt128 seed)
+        {
+            Debug.Assert(ArmAes.IsSupported);
+
+            Vector128<byte> hash = CompressArm(ref data, length);
+            hash = ArmAes.MixColumns(ArmAes.Encrypt(hash, Vector128<byte>.Zero)) ^ Unsafe.As<UInt128, Vector128<byte>>(ref seed);
+            return FinalizeArm(hash).AsInt32().GetElement(0);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [CompExactlyDependsOn(typeof(ArmAes))]
+        private static Vector128<byte> FinalizeArm(Vector128<byte> input)
+        {
+            Debug.Assert(ArmAes.IsSupported);
+
+            Vector128<byte> output = ArmAes.MixColumns(ArmAes.Encrypt(input, Vector128<byte>.Zero)) ^ FinalizeKeys1;
+            output = ArmAes.MixColumns(ArmAes.Encrypt(output, Vector128<byte>.Zero)) ^ FinalizeKeys2;
+            return ArmAes.Encrypt(output, Vector128<byte>.Zero) ^ FinalizeKeys3;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [CompExactlyDependsOn(typeof(ArmAes))]
+        private static Vector128<byte> CompressArm(ref byte data, int length)
+        {
+            Debug.Assert(ArmAes.IsSupported);
+
+            ref Vector128<byte> ptr = ref Unsafe.As<byte, Vector128<byte>>(ref data);
+
+            if (length <= VectorSize)
+            {
+                return GetPartialVector(ref ptr, length);
+            }
+
+            Vector128<byte> hashVector;
+            int remainingBytes;
+
+            int extraBytesCount = length % VectorSize;
+            if (extraBytesCount == 0)
+            {
+                hashVector = ptr;
+                ptr = ref Unsafe.Add(ref ptr, 1);
+                remainingBytes = length - VectorSize;
+            }
+            else
+            {
+                hashVector = GetPartialVectorUnsafe(ref ptr, extraBytesCount);
+                ptr = ref Unsafe.AddByteOffset(ref ptr, extraBytesCount);
+                remainingBytes = length - extraBytesCount;
+            }
+
+            if (length <= VectorSize * 2)
+            {
+                return CompressTwoArm(hashVector, ptr);
+            }
+
+            if (length <= VectorSize * 3)
+            {
+                return CompressTwoArm(hashVector, CompressTwoArm(ptr, Unsafe.Add(ref ptr, 1)));
+            }
+
+            return CompressManyArm(ref ptr, hashVector, remainingBytes);
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [CompExactlyDependsOn(typeof(ArmAes))]
+        private static Vector128<byte> CompressManyArm(ref Vector128<byte> start, Vector128<byte> hashVector, int len)
+        {
+            Debug.Assert(ArmAes.IsSupported);
+
+            int unrollableBlocksCount = len / (VectorSize * UnrollFactor) * UnrollFactor;
+            ref Vector128<byte> end2 = ref Unsafe.Add(ref start, unrollableBlocksCount);
+
+            while (Unsafe.IsAddressLessThan(ref start, ref end2))
+            {
+                Vector128<byte> blockHash = start;
+                blockHash = ArmAes.MixColumns(ArmAes.Encrypt(blockHash, Vector128<byte>.Zero)) ^ Unsafe.Add(ref start, 1);
+                blockHash = ArmAes.MixColumns(ArmAes.Encrypt(blockHash, Vector128<byte>.Zero)) ^ Unsafe.Add(ref start, 2);
+                blockHash = ArmAes.MixColumns(ArmAes.Encrypt(blockHash, Vector128<byte>.Zero)) ^ Unsafe.Add(ref start, 3);
+                blockHash = ArmAes.MixColumns(ArmAes.Encrypt(blockHash, Vector128<byte>.Zero)) ^ Unsafe.Add(ref start, 4);
+                blockHash = ArmAes.MixColumns(ArmAes.Encrypt(blockHash, Vector128<byte>.Zero)) ^ Unsafe.Add(ref start, 5);
+                blockHash = ArmAes.MixColumns(ArmAes.Encrypt(blockHash, Vector128<byte>.Zero)) ^ Unsafe.Add(ref start, 6);
+                blockHash = ArmAes.MixColumns(ArmAes.Encrypt(blockHash, Vector128<byte>.Zero)) ^ Unsafe.Add(ref start, 7);
+                start = ref Unsafe.Add(ref start, UnrollFactor);
+
+                hashVector = CompressTwoArm(hashVector, blockHash);
+            }
+
+            int remainingBlocksCount = len / VectorSize - unrollableBlocksCount;
+            ref Vector128<byte> end = ref Unsafe.Add(ref start, remainingBlocksCount);
+
+            while (Unsafe.IsAddressLessThan(ref start, ref end))
+            {
+                hashVector = CompressTwoArm(hashVector, start);
+                start = ref Unsafe.Add(ref start, 1);
+            }
+
+            return hashVector;
+        }
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
+        [CompExactlyDependsOn(typeof(ArmAes))]
+        private static Vector128<byte> CompressTwoArm(Vector128<byte> a, Vector128<byte> b)
+        {
+            Debug.Assert(ArmAes.IsSupported);
+
+            b = ArmAes.MixColumns(ArmAes.Encrypt(b, Vector128<byte>.Zero)) ^ CompressKeys1;
+            b = ArmAes.MixColumns(ArmAes.Encrypt(b, Vector128<byte>.Zero)) ^ CompressKeys2;
+            return ArmAes.Encrypt(a, Vector128<byte>.Zero) ^ b;
+        }
+
+        // ==================== Shared Helper Methods ====================
+
+        [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static unsafe Vector128<byte> GetPartialVector(ref Vector128<byte> start, int remainingBytes)
         {
-            // Check if we can safely read beyond the input
-            // 4096 bytes is a conservative value for the page size
             const int PageSize = 0x1000;
             nint address = (nint)Unsafe.AsPointer(ref start);
             nint offsetWithinPage = address & (PageSize - 1);
@@ -229,49 +367,9 @@ namespace System
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static Vector128<byte> GetPartialVectorUnsafe(ref Vector128<byte> start, int remainingBytes)
         {
-            Vector128<sbyte> indices = Vector128.Create((sbyte)0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
-            Vector128<byte> mask = Vector128.GreaterThan(Vector128.Create((sbyte)remainingBytes), indices).AsByte();
+            Vector128<byte> mask = Vector128.GreaterThan(Vector128.Create((sbyte)remainingBytes), Indices).AsByte();
             Vector128<byte> hashVector = Vector128.BitwiseAnd(mask, start);
             return Vector128.Add(hashVector, Vector128.Create((byte)remainingBytes));
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static Vector128<byte> CompressTwo(Vector128<byte> a, Vector128<byte> b)
-        {
-            Vector128<byte> keys1 = Vector128.Create(0xFC3BC28Eu, 0x89C222E5u, 0xB09D3E21u, 0xF2784542u).AsByte();
-            Vector128<byte> keys2 = Vector128.Create(0x03FCE279u, 0xCB6B2E9Bu, 0xB361DC58u, 0x39136BD9u).AsByte();
-
-            if (ArmAes.IsSupported)
-            {
-                b = (ArmAes.MixColumns(ArmAes.Encrypt(b, Vector128<byte>.Zero))) ^ keys1;
-                b = (ArmAes.MixColumns(ArmAes.Encrypt(b, Vector128<byte>.Zero))) ^ keys2;
-                return ArmAes.Encrypt(a, Vector128<byte>.Zero) ^ b;
-            }
-
-            if (X86Aes.IsSupported)
-            {
-                b = X86Aes.Encrypt(b, keys1);
-                b = X86Aes.Encrypt(b, keys2);
-                return X86Aes.EncryptLast(a, b);
-            }
-
-            return default;
-        }
-
-        [MethodImpl(MethodImplOptions.AggressiveInlining)]
-        private static Vector128<byte> CompressFast(Vector128<byte> a, Vector128<byte> b)
-        {
-            if (ArmAes.IsSupported)
-            {
-                return ArmAes.MixColumns(ArmAes.Encrypt(a, Vector128<byte>.Zero)) ^ b;
-            }
-
-            if (X86Aes.IsSupported)
-            {
-                return X86Aes.Encrypt(a, b);
-            }
-
-            return default;
         }
     }
 }
