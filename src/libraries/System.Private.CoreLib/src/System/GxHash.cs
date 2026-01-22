@@ -29,6 +29,7 @@ namespace System
         private static readonly Vector128<byte> CompressKeys1 = Vector128.Create(0xFC3BC28Eu, 0x89C222E5u, 0xB09D3E21u, 0xF2784542u).AsByte();
         private static readonly Vector128<byte> CompressKeys2 = Vector128.Create(0x03FCE279u, 0xCB6B2E9Bu, 0xB361DC58u, 0x39136BD9u).AsByte();
         private static readonly Vector128<sbyte> Indices = Vector128.Create((sbyte)0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12, 13, 14, 15);
+        private static readonly Vector128<short> CharIndices = Vector128.Create((short)0, 1, 2, 3, 4, 5, 6, 7);
 
         /// <summary>
         /// Returns true if GXHash is supported on the current platform.
@@ -107,29 +108,17 @@ namespace System
         [MethodImpl(MethodImplOptions.AggressiveInlining)]
         private static bool TryUppercaseAsciiVector(Vector128<ushort> chars, int count, out Vector128<ushort> uppercased)
         {
-            // For full vectors, check all 8 chars
-            if (count == 8)
+            // Vectorized ASCII check: mask out garbage positions, then check high bits
+            // CharIndices = [0,1,2,3,4,5,6,7] as short
+            Vector128<ushort> validMask = Vector128.GreaterThan(Vector128.Create((short)count), CharIndices).AsUInt16();
+            Vector128<ushort> maskedChars = chars & validMask;
+
+            // Check if any valid char has high bit set (non-ASCII)
+            Vector128<ushort> asciiMask = Vector128.Create((ushort)0xFF80);
+            if ((maskedChars & asciiMask) != Vector128<ushort>.Zero)
             {
-                Vector128<ushort> asciiMask = Vector128.Create((ushort)0xFF80);
-                if ((chars & asciiMask) != Vector128<ushort>.Zero)
-                {
-                    uppercased = default;
-                    return false;
-                }
-            }
-            else
-            {
-                // For partial vectors, we can't use the garbage bytes for ASCII check
-                // Check each valid char individually using scalar operations
-                ref ushort charRef = ref Unsafe.As<Vector128<ushort>, ushort>(ref chars);
-                for (int i = 0; i < count; i++)
-                {
-                    if (Unsafe.Add(ref charRef, i) > 0x7F)
-                    {
-                        uppercased = default;
-                        return false;
-                    }
-                }
+                uppercased = default;
+                return false;
             }
 
             // Branchless uppercase: XOR with 0x20 if char is in [a-z]
