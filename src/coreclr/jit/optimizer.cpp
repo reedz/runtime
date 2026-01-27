@@ -4097,14 +4097,52 @@ void Compiler::optHoistLoopBlocks(FlowGraphNaturalLoop* loop,
             }
             else if ((node->gtFlags & GTF_ORDER_SIDEEFF) != 0)
             {
-                // If a node has an order side effect, we can't hoist it at all: we don't know what the order
-                // dependence actually is. For example, assertion prop might have determined a node can't throw
-                // an exception, and eliminated the GTF_EXCEPT flag, replacing it with GTF_ORDER_SIDEEFF. We
-                // can't hoist because we might then hoist above the expression that led assertion prop to make
-                // that decision. This can happen in JitOptRepeat, where hoisting can follow assertion prop.
+                // If a node has an order side effect, we normally can't hoist it because we don't know
+                // what the order dependence actually is. For example, assertion prop might have determined
+                // a node can't throw an exception, and eliminated the GTF_EXCEPT flag, replacing it with
+                // GTF_ORDER_SIDEEFF. We can't hoist because we might then hoist above the expression that
+                // led assertion prop to make that decision.
+                //
+                // However, for field loads through a TYP_REF base where the base's SSA definition is outside
+                // the loop, the non-null assertion came from outside the loop (e.g., method parameter or
+                // pre-loop assignment), so it's safe to hoist.
+                if (node->OperIsIndir())
+                {
+                    GenTree* addr = node->AsIndir()->Addr();
+                    FieldSeq*      fldSeq = nullptr;
+                    ssize_t        offset = 0;
+                    GenTree*       baseAddr = nullptr;
+
+                    if (addr->IsFieldAddr(m_compiler, &baseAddr, &fldSeq, &offset))
+                    {
+                        if (baseAddr != nullptr && baseAddr->TypeIs(TYP_REF))
+                        {
+                            // Check if the base address has its SSA definition outside the loop.
+                            // This indicates the non-null assertion source is outside the loop,
+                            // making it safe to hoist.
+                            if (baseAddr->OperIs(GT_LCL_VAR))
+                            {
+                                GenTreeLclVarCommon* lclVar = baseAddr->AsLclVarCommon();
+                                if (lclVar->HasSsaName())
+                                {
+                                    LclSsaVarDsc* ssaDef = m_compiler->lvaGetDesc(lclVar)->GetPerSsaData(lclVar->GetSsaNum());
+                                    if (!m_loop->ContainsBlock(ssaDef->GetBlock()))
+                                    {
+                                        // The base's SSA definition is outside the loop.
+                                        // The non-null assertion came from outside the loop, so hoisting is safe.
+                                        JITDUMP("      [%06u] GTF_ORDER_SIDEEFF but field load through TYP_REF with SSA def outside loop - hoistable\n",
+                                                dspTreeID(node));
+                                        goto checkCSECandidate;
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
                 return false;
             }
 
+        checkCSECandidate:
             // Tree must be a suitable CSE candidate for us to be able to hoist it.
             return m_compiler->optIsCSEcandidate(node);
         }
@@ -4121,6 +4159,17 @@ void Compiler::optHoistLoopBlocks(FlowGraphNaturalLoop* loop,
             //
             if (vnIsInvariant)
             {
+                vnIsInvariant = IsTreeLoopMemoryInvariant(tree);
+            }
+            else
+            {
+                // The VN-based check may fail for field loads even when the specific field
+                // is not modified in the loop. This happens because the GcHeap VN includes
+                // MapStore operations for all modified fields, and VN doesn't simplify
+                // MapSelect(MapStore(base, k1, v), k2) to MapSelect(base, k2) when k1 != k2
+                // and the keys are handles (not constants).
+                //
+                // Check if this is a field load for a field that isn't modified.
                 vnIsInvariant = IsTreeLoopMemoryInvariant(tree);
             }
             return vnIsInvariant;
@@ -4169,6 +4218,77 @@ void Compiler::optHoistLoopBlocks(FlowGraphNaturalLoop* loop,
                 return true;
             }
 
+            // For field loads through field addresses, check if the specific field is
+            // modified in the loop. If not, the load is invariant regardless of other
+            // memory modifications. This handles cases where the VN system cannot
+            // simplify MapSelect(MapStore(base, k1, v), k2) to MapSelect(base, k2)
+            // when k1 != k2, because the VN simplification requires both keys to be
+            // recognized as constants for that optimization.
+            //
+            // This optimization specifically helps List<T> indexer performance where
+            // _items is loaded inside a loop that also modifies _version. The VN system
+            // creates MapStore for _version updates, but cannot prove that selecting
+            // _items from that map returns the same value as selecting from the base map.
+            //
+            if (tree->OperIsIndir())
+            {
+                GenTree*  baseAddr = nullptr;
+                FieldSeq* fldSeq   = nullptr;
+                ssize_t   offset   = 0;
+
+                GenTree* addr = tree->AsIndir()->Addr();
+                if (addr->IsFieldAddr(m_compiler, &baseAddr, &fldSeq, &offset))
+                {
+                    // This is a load through a field address.
+                    // Check if this specific field is modified in the loop.
+                    LoopSideEffects& sideEffects = m_compiler->m_loopSideEffects[m_loop->GetIndex()];
+                    if (!sideEffects.HasMemoryHavoc[GcHeap])
+                    {
+                        // No GcHeap havoc. Check if this specific field is modified.
+                        FieldHandleSet* fieldsModified = sideEffects.FieldsModified;
+                        CORINFO_FIELD_HANDLE fieldHandle = fldSeq->GetFieldHandle();
+                        FieldKindForVN       fieldKind;
+
+                        if (fieldsModified == nullptr || !fieldsModified->Lookup(fieldHandle, &fieldKind))
+                        {
+                            // This field is not modified in the loop.
+                            // The load is invariant for GcHeap purposes.
+                            // But we must still check ByrefExposed in case a byref aliases this field.
+
+                            // Check if the base address is a reference type (not a byref).
+                            // If so, byrefs cannot alias it and we can skip the ByrefExposed check.
+                            if (baseAddr != nullptr && baseAddr->TypeIs(TYP_REF))
+                            {
+                                // Base is a reference type - byrefs cannot alias object fields.
+                                // We already checked the field isn't in FieldsModified.
+                                JITDUMP("      [%06u] field load through TYP_REF, field not modified - invariant\n",
+                                        m_compiler->dspTreeID(tree));
+                                return true;
+                            }
+
+                            // For static fields or fields accessed through byrefs,
+                            // we need to check ByrefExposed.
+                            // Fall through to the standard check, but only for ByrefExposed.
+                            NodeToLoopMemoryBlockMap* const map            = m_compiler->GetNodeToLoopMemoryBlockMap();
+                            BasicBlock*                     loopEntryBlock = nullptr;
+                            if (map->Lookup(tree, &loopEntryBlock))
+                            {
+                                ValueNum loopMemoryVN =
+                                    m_compiler->GetMemoryPerSsaData(loopEntryBlock->bbMemorySsaNumIn[ByrefExposed])
+                                        ->m_vnPair.GetLiberal();
+                                if (!m_compiler->optVNIsLoopInvariant(loopMemoryVN, m_loop,
+                                                                      &m_hoistContext->m_curLoopVnInvariantCache))
+                                {
+                                    return false;
+                                }
+                            }
+                            return true;
+                        }
+                    }
+                }
+            }
+
+            // Standard memory invariance check for non-field loads
             NodeToLoopMemoryBlockMap* const map            = m_compiler->GetNodeToLoopMemoryBlockMap();
             BasicBlock*                     loopEntryBlock = nullptr;
             if (map->Lookup(tree, &loopEntryBlock))
@@ -4549,6 +4669,7 @@ void Compiler::optHoistLoopBlocks(FlowGraphNaturalLoop* loop,
             //
             if (!treeIsHoistable && treeHasHoistableChildren)
             {
+                JITDUMP("      [%06u] NOT hoistable but has hoistable children!\n", dspTreeID(tree));
                 // The current tree is not hoistable but it has hoistable children that we need
                 // to hoist now.
                 //
