@@ -4241,12 +4241,14 @@ void Compiler::optHoistLoopBlocks(FlowGraphNaturalLoop* loop,
                 {
                     // This is a load through a field address.
                     // Check if this specific field is modified in the loop.
+                    CORINFO_FIELD_HANDLE fieldHandle = fldSeq->GetFieldHandle();
+                    assert(fieldHandle != NO_FIELD_HANDLE);
+
                     LoopSideEffects& sideEffects = m_compiler->m_loopSideEffects[m_loop->GetIndex()];
                     if (!sideEffects.HasMemoryHavoc[GcHeap])
                     {
                         // No GcHeap havoc. Check if this specific field is modified.
                         FieldHandleSet* fieldsModified = sideEffects.FieldsModified;
-                        CORINFO_FIELD_HANDLE fieldHandle = fldSeq->GetFieldHandle();
                         FieldKindForVN       fieldKind;
 
                         if (fieldsModified == nullptr || !fieldsModified->Lookup(fieldHandle, &fieldKind))
